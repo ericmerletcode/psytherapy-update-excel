@@ -1,12 +1,17 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
-import pandas as pd
-import io
+from openpyxl import load_workbook
+from io import BytesIO
 import re
 
 app = FastAPI()
 
+
 def parse_export_block(text: str):
+    """
+    Parse le bloc [EXCEL_EXPORT] et renvoie un dict:
+    { nom_section: [ [col1, col2, ...], ... ] }
+    """
     sections = {}
     current_section = None
     in_export = False
@@ -22,25 +27,33 @@ def parse_export_block(text: str):
         if not in_export:
             continue
 
-        section_match = re.match(r"\[(.+?)\]", line)
-        if section_match:
-            current_section = section_match.group(1)
+        # Nouvelle section [Nom de section]
+        m = re.match(r"\[(.+?)\]", line)
+        if m:
+            current_section = m.group(1)
             sections[current_section] = []
             continue
 
+        # Ligne de données (séparateur |)
         if "|" in line and current_section:
-            parts = [col.strip() for col in line.split("|")]
+            parts = [c.strip() for c in line.split("|")]
             sections[current_section].append(parts)
 
     return sections
 
 
-def append_rows(df, rows):
+def append_rows_to_sheet(ws, rows):
+    """
+    Ajoute des lignes à une feuille openpyxl, en adaptant
+    la longueur de la ligne au nombre de colonnes existant.
+    """
+    max_cols = ws.max_column
     for row in rows:
-        if len(row) != len(df.columns):
-            row = row[:len(df.columns)] + [""] * (len(df.columns) - len(row))
-        df.loc[len(df)] = row
-    return df
+        if len(row) < max_cols:
+            row = row + [""] * (max_cols - len(row))
+        elif len(row) > max_cols:
+            row = row[:max_cols]
+        ws.append(row)
 
 
 @app.post("/update_excel")
@@ -48,60 +61,78 @@ async def update_excel(
     export_block: str = Form(...),
     excel_file: UploadFile = File(...)
 ):
-
+    # Lecture du fichier Excel en mémoire
     content = await excel_file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Fichier Excel vide ou illisible.")
+
+    try:
+        wb = load_workbook(filename=BytesIO(content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Impossible de lire le fichier Excel: {e}")
+
+    # Vérification des onglets obligatoires
+    required_sheets = [
+        "Infos Patient",
+        "Historique Séances",
+        "Analyse Clinique",
+        "Thérapeutiques",
+        "Lithothérapie",
+        "Suivi",
+    ]
+    for name in required_sheets:
+        if name not in wb.sheetnames:
+            raise HTTPException(status_code=400, detail=f"Onglet manquant: {name}")
+
+    ws_infos = wb["Infos Patient"]
+    ws_histo = wb["Historique Séances"]
+    ws_analyse = wb["Analyse Clinique"]
+    ws_therap = wb["Thérapeutiques"]
+    ws_litho = wb["Lithothérapie"]
+    ws_suivi = wb["Suivi"]
+
+    # Parse du bloc EXCEL_EXPORT
     sections = parse_export_block(export_block)
 
-    file_stream = io.BytesIO(content)
-    excel = pd.ExcelFile(file_stream)
+    # Ajout dans les différents onglets
+    if "Historique Séances" in sections and sections["Historique Séances"]:
+        append_rows_to_sheet(ws_histo, sections["Historique Séances"])
 
-    infos = pd.read_excel(excel, sheet_name="Infos Patient")
-    histo = pd.read_excel(excel, sheet_name="Historique Séances")
-    analyse = pd.read_excel(excel, sheet_name="Analyse Clinique")
-    therapeu = pd.read_excel(excel, sheet_name="Thérapeutiques")
-    litho = pd.read_excel(excel, sheet_name="Lithothérapie")
-    suivi = pd.read_excel(excel, sheet_name="Suivi")
+    if "Analyse Clinique" in sections and sections["Analyse Clinique"]:
+        append_rows_to_sheet(ws_analyse, sections["Analyse Clinique"])
 
-    if "Historique Séances" in sections:
-        histo = append_rows(histo, sections["Historique Séances"])
+    if "Thérapeutiques" in sections and sections["Thérapeutiques"]:
+        append_rows_to_sheet(ws_therap, sections["Thérapeutiques"])
 
-    if "Analyse Clinique" in sections:
-        analyse = append_rows(analyse, sections["Analyse Clinique"])
+    if "Lithothérapie" in sections and sections["Lithothérapie"]:
+        append_rows_to_sheet(ws_litho, sections["Lithothérapie"])
 
-    if "Thérapeutiques" in sections:
-        therapeu = append_rows(therapeu, sections["Thérapeutiques"])
+    if "Suivi" in sections and sections["Suivi"]:
+        append_rows_to_sheet(ws_suivi, sections["Suivi"])
 
-    if "Lithothérapie" in sections:
-        litho = append_rows(litho, sections["Lithothérapie"])
-
-    if "Suivi" in sections:
-        suivi = append_rows(suivi, sections["Suivi"])
-
-    # Update Infos Patient B13 à B16
-    update_map = {
-        "Demande": 12,
-        "Famille": 13,
-        "Sante": 14,
-        "Situation": 15
+    # Mise à jour Infos Patient : B13–B16
+    # sections attendues: [Demande], [Famille], [Sante], [Situation]
+    update_cells = {
+        "Demande": "B13",
+        "Famille": "B14",
+        "Sante": "B15",
+        "Situation": "B16",
     }
 
-    for field, row_idx in update_map.items():
-        if field in sections and sections[field]:
-            value = sections[field][0][-1]
-            infos.iloc[row_idx, 1] = value
+    for section_name, cell in update_cells.items():
+        if section_name in sections and sections[section_name]:
+            first_row = sections[section_name][0]
+            # On suppose que le texte intéressant est dans la dernière colonne de la ligne
+            value = first_row[-1].strip()
+            ws_infos[cell] = value
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        infos.to_excel(writer, sheet_name="Infos Patient", index=False)
-        histo.to_excel(writer, sheet_name="Historique Séances", index=False)
-        analyse.to_excel(writer, sheet_name="Analyse Clinique", index=False)
-        therapeu.to_excel(writer, sheet_name="Thérapeutiques", index=False)
-        litho.to_excel(writer, sheet_name="Lithothérapie", index=False)
-        suivi.to_excel(writer, sheet_name="Suivi", index=False)
-
+    # Sauvegarde en mémoire (en conservant styles et formats)
+    output = BytesIO()
+    wb.save(output)
     output.seek(0)
+
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=updated.xlsx"}
+        headers={"Content-Disposition": 'attachment; filename="updated.xlsx"'},
     )
